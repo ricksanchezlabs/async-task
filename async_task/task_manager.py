@@ -1,10 +1,6 @@
 import asyncio
-import json
+import signal
 import traceback
-from json import JSONDecodeError
-
-import async_timeout
-from aioredis.client import PubSub
 
 from async_task import RedisClient, logger, settings
 
@@ -12,52 +8,57 @@ from async_task import RedisClient, logger, settings
 class TaskManager:
     _tasks = {}
 
-    def __init__(self, channel_name: str = 'default'):
-        self.channel_name = channel_name
+    def __init__(self, queue_name: str = 'default'):
+        self.queue_name = queue_name
         self.redis = RedisClient(settings.REDIS_HOST)
+
+        self.loop = asyncio.get_event_loop()
+
+        self.stop = False
+
+        for s in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+            self.loop.add_signal_handler(s, lambda _s=s: asyncio.create_task(self._gracefully_stop(_s)))
 
     def register(self, func):
         self._tasks[func.__name__] = func
+        return func
 
-    async def send_task(self, channel_name: str, task: str, args: list, kwargs: dict):
-        payload = dict(
-            task=task,
-            args=args,
-            kwargs=kwargs
-        )
-        await self.redis.publish_message(channel_name, payload)
+    async def _listen_to_queue(self):
+        while not self.stop:
+            if not (payload := await self.redis.pop_message(self.queue_name)):
+                continue
 
-    async def process_message(self, channel: PubSub):
-        while True:
-            try:
-                async with async_timeout.timeout(1):
-                    message = await channel.get_message(ignore_subscribe_messages=True)
-                    if message is not None and message.get('channel') == self.channel_name:
-                        try:
-                            payload = json.loads(message.get('data'))
-                        except JSONDecodeError:
-                            pass
-                        else:
-                            task = payload.get('task')
-                            args = payload.get('args', ())
-                            kwargs = payload.get('kwargs', {})
-                            if task in self._tasks:
-                                fn = self._tasks.get(task)
-                                logger.info(f'Calling {task=} with {args=} and {kwargs=}')
-                                # noinspection PyBroadException
-                                try:
-                                    # noinspection PyAsyncCall
-                                    asyncio.create_task(fn(*args, **kwargs))
-                                except Exception:
-                                    logger.error('Error calling task\n' + traceback.format_exc())
-                    await asyncio.sleep(0.01)
-            except asyncio.TimeoutError:
-                pass
+            task = payload.get('task')
+            if fn := self._tasks.get(task):
+                args = payload.get('args', ())
+                kwargs = payload.get('kwargs', {})
+                # noinspection PyBroadException
+                try:
+                    logger.info(f'Calling {task=} with {args=} and {kwargs=}')
+                    # noinspection PyAsyncCall
+                    asyncio.create_task(fn(*args, **kwargs))
+                except Exception:
+                    logger.error('Error calling task\n' + traceback.format_exc())
 
-    async def run(self):
-        logger.info(f'Subscribing to channel {self.channel_name}...')
-        pubsub = await self.redis.subscribe_channel(self.channel_name)
-        await asyncio.create_task(self.process_message(pubsub))
+    def run(self):
+        self.loop.create_task(self._listen_to_queue())
+        logger.info(f'Listening to queue {self.queue_name}...')
+        self.loop.run_forever()
+        self.loop.close()
 
-    async def close(self):
+    async def _close(self):
         await self.redis.close()
+
+    async def _gracefully_stop(self, _signal):
+        self.stop = True
+
+        logger.info(f'Received signal {_signal}, gracefully stopping')
+        try:
+            if running_tasks := [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]:
+                await asyncio.wait(running_tasks, timeout=settings.GRACEFUL_STOP_TIMEOUT)
+
+            await self._close()
+        except Exception as e:
+            logger.exception(f'Exception occurred while gracefully stopping {e=}')
+        finally:
+            self.loop.stop()
